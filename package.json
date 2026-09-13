@@ -1,0 +1,13 @@
+{
+  "name": "morrow",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "cargo run -p morrow-cli -- ui",
+    "serve": "cargo run -p morrow-cli -- serve --host 127.0.0.1 --port 8471",
+    "ui": "cargo run -p morrow-cli -- ui",
+    "init-config": "cargo run -p morrow-cli -- init-config",
+    "build": "cargo build -p morrow-cli",
+    "install-cli": "cargo install --path crates/morrow-cli"
+  }
+}

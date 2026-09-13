@@ -1,0 +1,22 @@
+[package]
+name = "morrow-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+morrow-core.workspace = true
+morrow-provider.workspace = true
+morrow-tools.workspace = true
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

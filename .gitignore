@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Rust
+# ─────────────────────────────────────────────────────────────────────────────
+/target/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# morrow local state
+#
+# `.morrow/config.toml` is generated per-machine and can hold real API keys —
+# it must never be committed. Project knowledge that IS safe and intended to be
+# shared (`.morrow/rules/`, `.morrow/commands/`, `.morrow/MEMORY.md`,
+# `.morrow/config.example.toml`) is not ignored.
+# ─────────────────────────────────────────────────────────────────────────────
+.morrow/config.toml
+.morrow/sessions/
+.morrow/state.json
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Yarn (app mode — generated at install time, not part of the repo)
+# ─────────────────────────────────────────────────────────────────────────────
+.pnp.cjs
+.pnp.loader.mjs
+.yarn/install-state.gz
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Editors / OS
+# ─────────────────────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logs
+# ─────────────────────────────────────────────────────────────────────────────
+*.log

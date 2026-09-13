@@ -1,0 +1,149 @@
+# morrow configuration
+# Uncomment the block(s) you need, then `morrow` picks them up.
+# Protocols: openai-chat | openai-responses | anthropic
+# api_key: "$ENV_VAR" (recommended) or a literal key. Omit for keyless local endpoints.
+#
+# default_model = "codex-mini"
+
+# ---------------------------------------------------------------- OpenAI ---
+# Chat Completions API (gpt-4o, gpt-4.1, o-series, ...).
+# [providers.openai]
+# base_url = "https://api.openai.com/v1"
+# api_key = "$OPENAI_API_KEY"
+# protocol = "openai-chat"
+#
+# [models.gpt]
+# id = "gpt-4.1-mini"
+# provider = "openai"
+# display_name = "GPT 4.1 Mini"
+# context_window = 1048576
+
+# ------------------------------------------------------------ Codex --------
+# Codex / Responses API (codex-mini-latest, gpt-5-codex, ...).
+# Same host, different wire protocol.
+# [providers.codex]
+# base_url = "https://api.openai.com/v1"
+# api_key = "$OPENAI_API_KEY"
+# protocol = "openai-responses"
+#
+# [models.codex-mini]
+# id = "codex-mini-latest"
+# provider = "codex"
+# display_name = "Codex Mini"
+# context_window = 200000
+
+# ---------------------------------------------------------- Anthropic ------
+# Claude via the Messages API (Sonnet, Opus, Haiku, ...).
+# [providers.claude]
+# base_url = "https://api.anthropic.com"
+# api_key = "$ANTHROPIC_API_KEY"
+# protocol = "anthropic"
+#
+# [models.sonnet]
+# id = "claude-sonnet-4-5"
+# provider = "claude"
+# display_name = "Sonnet"
+# context_window = 200000
+
+# --------------------------------------------------------------- xAI -------
+# Grok models, OpenAI-compatible chat endpoint.
+# [providers.grok]
+# base_url = "https://api.x.ai/v1"
+# api_key = "$XAI_API_KEY"
+# protocol = "openai-chat"
+#
+# [models.grok-fast]
+# id = "grok-4-1-fast-non-reasoning"
+# provider = "grok"
+# display_name = "Grok Fast"
+# context_window = 2000000
+
+# -------------------------------------------------------------- Groq -------
+# [providers.groq]
+# base_url = "https://api.groq.com/openai/v1"
+# api_key = "$GROQ_API_KEY"
+# protocol = "openai-chat"
+#
+# [models.groq-llama]
+# id = "llama-3.3-70b-versatile"
+# provider = "groq"
+# context_window = 131072
+
+# ----------------------------------------------------------- DeepSeek ------
+# [providers.deepseek]
+# base_url = "https://api.deepseek.com/v1"
+# api_key = "$DEEPSEEK_API_KEY"
+# protocol = "openai-chat"
+#
+# [models.deepseek-chat]
+# id = "deepseek-chat"
+# provider = "deepseek"
+# context_window = 64000
+
+# --------------------------------------------------------- OpenRouter ------
+# Any model on OpenRouter (Anthropic + OpenAI + others through one key).
+# Use the openai-chat protocol with "provider/model" ids.
+# [providers.openrouter]
+# base_url = "https://openrouter.ai/api/v1"
+# api_key = "$OPENROUTER_API_KEY"
+# protocol = "openai-chat"
+#
+# [providers.openrouter.headers]
+# HTTP-Referer = "https://morrow.local"
+# X-Title = "morrow"
+#
+# [models.or-sonnet]
+# id = "anthropic/claude-sonnet-4-5"
+# provider = "openrouter"
+# context_window = 200000
+
+# ------------------------------------------------------------- Ollama ------
+# Local models, no key needed. Any OpenAI-compatible host works here.
+# [providers.ollama]
+# base_url = "http://localhost:11434/v1"
+# protocol = "openai-chat"
+#
+# [models.local]
+# id = "qwen3:8b"
+# provider = "ollama"
+# context_window = 32768
+
+# ------------------------------------------------------------- Custom ------
+# Template for any other OpenAI-compatible endpoint (vLLM, LM Studio,
+# Together, Fireworks, Mistral, ...). Optional path_prefix / headers / query.
+# [providers.my-provider]
+# base_url = "https://my-endpoint.example.com/v1"
+# api_key = "$MY_API_KEY"
+# protocol = "openai-chat"         # or "openai-responses" / "anthropic"
+# path_prefix = "/v1"              # optional, appended before the endpoint path
+# [providers.my-provider.headers]  # optional extra headers
+# X-Custom = "value"
+# [providers.my-provider.query]    # optional extra query params
+# version = "2024-01-01"
+#
+# [models.fast]
+# id = "llama-4-scout"
+# provider = "my-provider"
+# display_name = "Scout"
+# context_window = 131072
+# max_tokens = 4096
+# temperature = 0.7
+
+# ----------------------------------------------------------- Subagents -----
+# [mcp_servers]                  # external tools via MCP (stdio)
+# [mcp_servers.files]            # tools appear as mcp_files_<tool>
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/sam/projects"]
+# enabled = true
+# timeout_secs = 60
+#
+# [permissions]                    # per-tool overrides (beat character mode)
+# edit = "ask"                     # ask | allow | deny — deny wins everywhere
+# bash = "ask"
+# read = "allow"
+# bash_deny = ["rm -rf /*", "git push --force*", "shutdown *"]  # always blocked
+#
+# [agents.reviewer]                # custom subagent
+# prompt = "You are a strict code reviewer."
+# model = "fast"                   # optional different model
+# tools = ["read", "grep", "glob"] # optional restricted toolset

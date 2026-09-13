@@ -1,0 +1,4 @@
+[alias]
+dev = "run -p morrow-cli -- ui"
+serve = "run -p morrow-cli -- serve"
+ui = "run -p morrow-cli -- ui"

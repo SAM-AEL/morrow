@@ -1,0 +1,8 @@
+# Local morrow state for this project.
+# config.toml is edited per-machine and may contain real API keys.
+config.toml
+sessions/
+state.json
+
+# The committed, documented template is kept.
+!config.example.toml
