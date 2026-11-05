@@ -1,10 +1,19 @@
+//! Application state and the reducer that drives it.
+//!
+//! `App` holds no I/O and no `Runner`: it receives [`AppEvent`]s, mutates, and
+//! exposes what the renderer needs. That separation is what makes the interface
+//! testable with `TestBackend` and keeps the event loop in `lib.rs` small.
+//!
+//! The transcript is a `Vec<Block>` rather than pre-rendered lines, so styling
+//! happens at draw time against the real terminal width. Baking styles at append
+//! time was what made responsive rendering impossible.
+
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::prelude::*;
-use ratatui::text::Line;
 
 use morrow_core::message::{Message, Role, Usage};
 
 use crate::approval::PendingApproval;
+use crate::text::{Block, Level};
 
 /// All slash commands with short descriptions for the autocomplete dropdown.
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -36,35 +45,37 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("quit", "exit morrow"),
 ];
 
-/// Commands that take a free-text argument (get trailing space on complete).
+/// Commands that take a free-text argument (get a trailing space on complete).
 fn command_takes_arg(name: &str) -> bool {
     matches!(name, "model" | "switch" | "agent" | "resume" | "new")
 }
 
 /// One completion row: what gets inserted vs. what is shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     pub insert: String,
     pub display: String,
     pub hint: String,
 }
 
-/// What the user submitted: a prompt for the agent or a local command output.
+/// What the user submitted: a prompt for the agent or a local command result.
+#[derive(Debug)]
 pub enum Command {
     Agent(String),
-    Local(Vec<Line<'static>>),
-    /// Switch to another persistent character (/switch <name>).
+    Local(Vec<Block>),
+    /// Switch to another persistent character (`/switch <name>`).
     Switch(String),
     /// Toggle Approval <-> Autonomous for the active character.
     ToggleMode,
-    /// Start a fresh session thread (/new [title]).
+    /// Start a fresh session thread (`/new [title]`).
     NewSession(Option<String>),
-    /// Resume a past session thread (/resume <id-prefix>).
+    /// Resume a past session thread (`/resume <id-prefix>`).
     Resume(String),
-    /// Rename the active thread (/rename [title|--auto]).
+    /// Rename the active thread (`/rename [title|--auto]`).
     Rename(Option<String>),
-    /// Compress history now (/compact [note]).
+    /// Compress history now (`/compact [note]`).
     Compact(Option<String>),
-    /// Save thread learnings to project memory (/flush [note]).
+    /// Save thread learnings to project memory (`/flush [note]`).
     Flush(Option<String>),
     /// Show active thread details.
     Info,
@@ -91,7 +102,7 @@ pub enum AppEvent {
     SubagentStart(String),
     SubagentEnd(String),
     Error(String),
-    /// Turn finished; runner returned for reuse.
+    /// Turn finished; the runner is handed back for reuse.
     Done(Box<morrow_agent::Runner>),
 }
 
@@ -125,9 +136,14 @@ impl AppEvent {
 }
 
 pub struct App {
-    lines: Vec<Line<'static>>,
+    blocks: Vec<Block>,
     input: String,
-    scroll: usize, // lines from bottom
+    /// Where the user has scrolled, in block-space from the bottom.
+    ///
+    /// `0` means pinned to the newest content. While the user has scrolled away
+    /// from the bottom, streaming updates must not drag the view back — that is
+    /// the whole reason this is explicit state rather than a draw-time default.
+    scroll: usize,
     submitted: Option<Command>,
     quit: bool,
     pending_approval: Option<PendingApproval>,
@@ -135,17 +151,17 @@ pub struct App {
     busy: bool,
     /// In-progress assistant text (streaming deltas accumulate here).
     assistant_buf: String,
-    /// /model <key> applied when the runner is handed back.
+    /// `/model <key>` applied when the runner is handed back.
     pending_model_switch: Option<String>,
     /// Header status line (character · model · mode).
     pub header_info: String,
-    /// Animation frame for the rainbow loader (bumped on a timer while busy).
+    /// Animation frame for the loader (bumped on a timer while busy).
     tick: u64,
-    /// Saved models for `/models` (key, id, provider) — injected at startup.
+    /// Saved models for `/models` — (key, id, provider).
     models: Vec<(String, String, String)>,
-    /// Subagents for `/agents` (name, description) — injected at startup.
+    /// Subagents for `/agents` — (name, description).
     agents: Vec<(String, String)>,
-    /// Known character names for `/switch` completion — injected at startup.
+    /// Known character names for `/switch` completion.
     characters: Vec<String>,
     /// Loaded project rule files for `/rules` — (display path, chars).
     rules: Vec<(String, usize)>,
@@ -155,12 +171,10 @@ pub struct App {
     project_root: std::path::PathBuf,
     /// Past threads for `/resume` completion + `/sessions` — (id, title, updated, msgs).
     sessions: Vec<(String, String, String, usize)>,
-    /// Fresh-launch banner shown in the welcome hero ("3 past sessions — /resume").
+    /// Fresh-launch banner shown in the welcome hero.
     session_banner: Option<String>,
-    /// Selected index into the live completion list (Tab/Up/Down).
+    /// Selected index into the live completion list.
     complete_sel: usize,
-    /// How many transcript lines currently show the streaming assistant buffer.
-    assistant_shown: usize,
 }
 
 impl Default for App {
@@ -172,7 +186,7 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         Self {
-            lines: Vec::new(),
+            blocks: Vec::new(),
             input: String::new(),
             scroll: 0,
             submitted: None,
@@ -193,9 +207,10 @@ impl App {
             sessions: Vec::new(),
             session_banner: None,
             complete_sel: 0,
-            assistant_shown: 0,
         }
     }
+
+    // ---- injected context ------------------------------------------------
 
     /// Inject the saved-model list shown by `/models`.
     pub fn set_models(&mut self, models: Vec<(String, String, String)>) {
@@ -229,7 +244,6 @@ impl App {
     }
 
     /// Inject past threads for `/resume` completion + `/sessions`.
-    /// Items: (id, title, updated-display, message-count).
     pub fn set_sessions(&mut self, sessions: Vec<(String, String, String, usize)>) {
         self.sessions = sessions;
         self.clamp_completion_sel();
@@ -244,12 +258,12 @@ impl App {
         self.session_banner.as_deref()
     }
 
+    // ---- transcript ------------------------------------------------------
+
     /// Replace the visible transcript with a resumed thread's messages.
-    /// Streaming state is dropped; the notice caller adds goes on top.
     pub fn replay_transcript(&mut self, messages: &[Message]) {
-        self.lines.clear();
+        self.blocks.clear();
         self.assistant_buf.clear();
-        self.assistant_shown = 0;
         self.scroll = 0;
         for m in messages {
             let text = m.plain_text();
@@ -257,48 +271,41 @@ impl App {
                 continue;
             }
             match m.role {
-                Role::User => self.lines.push(Line::styled(
-                    format!("❯ {text}"),
-                    Style::new().add_modifier(ratatui::style::Modifier::BOLD),
-                )),
-                Role::Assistant => {
-                    for l in text.lines() {
-                        self.lines.push(Line::from(l.to_string()));
-                    }
-                }
-                _ => self.lines.push(Line::styled(
-                    format!("· {}", text.lines().next().unwrap_or("")),
-                    Style::new().add_modifier(ratatui::style::Modifier::DIM),
-                )),
+                Role::User => self.blocks.push(Block::Prompt { text }),
+                Role::Assistant => self.blocks.push(Block::Assistant { text }),
+                _ => self.blocks.push(Block::System {
+                    text: text.lines().next().unwrap_or("").to_string(),
+                    level: Level::Info,
+                }),
             }
         }
     }
 
     /// Rendered `/memory` summary.
-    pub fn memory_lines(&self) -> Vec<Line<'static>> {
+    pub fn memory_lines(&self) -> Vec<Block> {
         match morrow_core::memory_stats(&self.project_root) {
-            None => vec![Line::from(
+            None => vec![info_block(
                 "no project memory yet — /flush saves this thread, remember(scope=project) too",
             )],
             Some((path, entries, bytes)) => vec![
-                Line::from(format!("project memory: {path}")),
-                Line::from(format!(
+                info_block(&format!("project memory: {path}")),
+                info_block(&format!(
                     "  {entries} entries · {bytes} bytes · injected every turn"
                 )),
             ],
         }
     }
 
-    /// Rendered `/sessions` list (also used for bare `/resume`).
-    pub fn sessions_lines(&self) -> Vec<Line<'static>> {
+    /// Rendered `/sessions` list (also used for a bare `/resume`).
+    pub fn sessions_lines(&self) -> Vec<Block> {
         if self.sessions.is_empty() {
-            return vec![Line::from(
+            return vec![info_block(
                 "no past sessions here yet — chat away, /new starts a thread",
             )];
         }
-        let mut out = vec![Line::from("past sessions (/resume <id>):")];
+        let mut out = vec![info_block("past sessions (/resume <id>):")];
         for (id, title, updated, msgs) in &self.sessions {
-            out.push(Line::from(format!(
+            out.push(info_block(&format!(
                 "  {}  {title}  · {updated} · {msgs} msgs",
                 short_id(id)
             )));
@@ -306,13 +313,15 @@ impl App {
         out
     }
 
+    // ---- completion ------------------------------------------------------
+
     /// Live completion items for the current input.
     pub fn completions(&self) -> Vec<Completion> {
         let input = self.input.trim_start();
         let Some(stripped) = input.strip_prefix('/') else {
             return Vec::new();
         };
-        // "/model <partial>" / "/switch <partial>" / "/resume <partial>" — values.
+        // `/model <partial>` / `/switch <partial>` / `/resume <partial>` — values.
         if let Some((cmd, rest)) = stripped.split_once(char::is_whitespace) {
             let partial = rest.trim_start().to_ascii_lowercase();
             match cmd {
@@ -366,7 +375,7 @@ impl App {
                 _ => return Vec::new(),
             }
         }
-        // "/<partial>" — complete command names (builtins + custom commands).
+        // `/<partial>` — command names (builtins + custom commands).
         let partial = stripped.to_ascii_lowercase();
         let mut out: Vec<Completion> = SLASH_COMMANDS
             .iter()
@@ -391,18 +400,18 @@ impl App {
         out
     }
 
-    /// Currently highlighted completion index (clamped by caller via completions()).
+    /// Currently highlighted completion index.
     pub fn completion_sel(&self) -> usize {
         self.complete_sel
     }
 
     fn clamp_completion_sel(&mut self) {
         let n = self.completions().len();
-        if n == 0 {
-            self.complete_sel = 0;
+        self.complete_sel = if n == 0 {
+            0
         } else {
-            self.complete_sel = self.complete_sel.min(n - 1);
-        }
+            self.complete_sel.min(n - 1)
+        };
     }
 
     /// Apply the highlighted completion to the input (Tab).
@@ -421,16 +430,15 @@ impl App {
             }
         };
         if is_command {
-            // Command completion.
             self.input = format!("/{picked}");
             if command_takes_arg(&picked) {
                 self.input.push(' ');
             }
         } else {
-            // Value completion: replace text after the last whitespace.
+            // Value completion: replace the text after the last whitespace.
             let pos = self
                 .input
-                .rfind(|c: char| c.is_whitespace())
+                .rfind(char::is_whitespace)
                 .map(|i| i + 1)
                 .unwrap_or(1);
             self.input.truncate(pos);
@@ -438,6 +446,8 @@ impl App {
         }
         self.complete_sel = 0;
     }
+
+    // ---- animation -------------------------------------------------------
 
     /// Advance the loader animation one frame.
     pub fn bump_tick(&mut self) {
@@ -456,10 +466,10 @@ impl App {
         self.busy = busy;
     }
 
-    /// Called when a turn's runner is reclaimed: flush text + clear busy.
+    /// Called when a turn's runner is reclaimed: flush text and clear busy.
     pub fn on_turn_done(&mut self) {
         self.flush_assistant();
-        self.finish_turn();
+        self.busy = false;
     }
 
     pub fn should_quit(&self) -> bool {
@@ -470,15 +480,31 @@ impl App {
         self.submitted.take()
     }
 
-    pub fn push_line(&mut self, line: Line<'static>) {
-        self.lines.push(line);
+    // ---- block append ----------------------------------------------------
+
+    pub fn push_blocks(&mut self, blocks: impl IntoIterator<Item = Block>) {
+        self.blocks.extend(blocks);
     }
 
+    /// Append a dim informational block.
     pub fn push_system(&mut self, text: &str) {
-        self.lines.push(Line::styled(
-            text.to_string(),
-            Style::new().add_modifier(ratatui::style::Modifier::DIM),
-        ));
+        self.blocks.push(info_block(text));
+    }
+
+    /// Append a dim informational block without the caller's formatting.
+    pub fn push_notice(&mut self, text: &str) {
+        self.blocks.push(Block::System {
+            text: text.to_string(),
+            level: Level::Notice,
+        });
+    }
+
+    /// Append an error block.
+    pub fn push_error(&mut self, text: &str) {
+        self.blocks.push(Block::System {
+            text: text.to_string(),
+            level: Level::Error,
+        });
     }
 
     /// Apply a local slash command against the live runner.
@@ -494,19 +520,16 @@ impl App {
         self.pending_approval = Some(req);
     }
 
+    // ---- input -----------------------------------------------------------
+
     pub fn on_key(&mut self, ev: Event) {
         match ev {
             Event::Key(key) => self.on_key_event(key),
             Event::Mouse(m) => match m.kind {
-                crossterm::event::MouseEventKind::ScrollUp => {
-                    self.scroll = self.scroll.saturating_add(3)
-                }
-                crossterm::event::MouseEventKind::ScrollDown => {
-                    self.scroll = self.scroll.saturating_sub(3)
-                }
+                crossterm::event::MouseEventKind::ScrollUp => self.scroll_by(3),
+                crossterm::event::MouseEventKind::ScrollDown => self.scroll_by(-3),
                 _ => {}
             },
-            Event::Resize(_, _) => {}
             _ => {}
         }
     }
@@ -515,8 +538,8 @@ impl App {
         if key.kind == crossterm::event::KeyEventKind::Release {
             return;
         }
-        if let Some(_req) = self.pending_approval.as_ref() {
-            // modal active
+        if self.pending_approval.is_some() {
+            // Modal is active: it owns the keyboard.
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.resolve_approval(true),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -529,7 +552,6 @@ impl App {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.busy {
-                    // cancel current input; real interruption of the model is future work
                     self.push_system("note: interrupting mid-turn is not supported yet");
                     self.input.clear();
                 } else {
@@ -543,19 +565,13 @@ impl App {
                 self.complete_sel = 0;
             }
             KeyCode::Up => {
-                let n = self.completions().len();
-                if n > 0 {
-                    self.complete_sel = self.complete_sel.checked_sub(1).unwrap_or(n - 1);
-                } else {
-                    self.scroll = self.scroll.saturating_add(3);
+                if !self.move_selection(-1) {
+                    self.scroll_by(3);
                 }
             }
             KeyCode::Down => {
-                let n = self.completions().len();
-                if n > 0 {
-                    self.complete_sel = (self.complete_sel + 1) % n;
-                } else {
-                    self.scroll = self.scroll.saturating_sub(3);
+                if !self.move_selection(1) {
+                    self.scroll_by(-3);
                 }
             }
             KeyCode::Tab => {
@@ -563,8 +579,9 @@ impl App {
                 self.apply_completion();
             }
             KeyCode::Esc => self.complete_sel = 0,
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(20),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(20),
+            KeyCode::Home => self.scroll_to_end(),
+            KeyCode::PageUp => self.scroll_by(20),
+            KeyCode::PageDown => self.scroll_by(-20),
             KeyCode::Char(c) => {
                 self.input.push(c);
                 self.clamp_completion_sel();
@@ -573,22 +590,33 @@ impl App {
         }
     }
 
+    /// Move the completion selection. Returns false when no list is open, so the
+    /// caller can fall through to scrolling the transcript.
+    fn move_selection(&mut self, delta: isize) -> bool {
+        let n = self.completions().len();
+        if n == 0 {
+            return false;
+        }
+        if delta < 0 {
+            self.complete_sel = self.complete_sel.checked_sub(1).unwrap_or(n - 1);
+        } else {
+            self.complete_sel = (self.complete_sel + 1) % n;
+        }
+        true
+    }
+
     fn resolve_approval(&mut self, allow: bool) {
         if let Some(req) = self.pending_approval.take() {
-            self.lines.push(Line::styled(
-                format!("  approval: {}", if allow { "allowed" } else { "denied" }),
-                ratatui::style::Style::new().fg(if allow {
-                    ratatui::style::Color::Green
-                } else {
-                    ratatui::style::Color::Red
-                }),
-            ));
+            self.blocks.push(Block::System {
+                text: format!("approval: {}", if allow { "allowed" } else { "denied" }),
+                level: if allow { Level::Info } else { Level::Error },
+            });
             req.answer(allow);
         }
     }
 
     fn submit(&mut self) {
-        // Enter with the dropdown open completes instead of sending "/" alone.
+        // Enter with the dropdown open completes instead of sending a bare "/".
         if !self.busy && self.input.trim_start().starts_with('/') {
             let items = self.completions();
             if !items.is_empty() {
@@ -596,12 +624,15 @@ impl App {
                 let stripped = raw_trim.strip_prefix('/').unwrap_or("").to_string();
                 let sel = self.complete_sel.min(items.len() - 1);
                 let should_complete = if stripped.contains(char::is_whitespace) {
-                    // "/cmd <partial>": complete unless the partial exactly
+                    // `/cmd <partial>`: complete unless the partial exactly
                     // equals the highlighted value.
-                    let partial = stripped.split(char::is_whitespace).last().unwrap_or("");
+                    let partial = stripped
+                        .split(char::is_whitespace)
+                        .next_back()
+                        .unwrap_or("");
                     !partial.eq_ignore_ascii_case(&items[sel].insert)
                 } else {
-                    // "/<partial>": complete unless it exactly names a command.
+                    // `/<partial>`: complete unless it exactly names a command.
                     !SLASH_COMMANDS
                         .iter()
                         .any(|(n, _)| stripped.eq_ignore_ascii_case(n))
@@ -619,13 +650,12 @@ impl App {
         if raw.is_empty() || self.busy {
             return;
         }
-        self.lines.push(Line::styled(
-            format!("❯ {raw}"),
-            Style::new().add_modifier(ratatui::style::Modifier::BOLD),
-        ));
+        // A new prompt pulls the reader back to the live edge.
+        self.scroll = 0;
         if let Some(cmd) = raw.strip_prefix('/') {
             self.submitted = Some(self.handle_slash(cmd));
         } else {
+            self.blocks.push(Block::Prompt { text: raw.clone() });
             self.busy = true;
             self.submitted = Some(Command::Agent(raw));
         }
@@ -636,30 +666,7 @@ impl App {
         let name = parts.next().unwrap_or("");
         let rest = parts.collect::<Vec<_>>().join(" ");
         match name {
-            "help" => Command::Local(vec![
-                Line::from("/help            show this help (Tab lists commands)"),
-                Line::from("/new [title]     start a fresh session (current thread is kept)"),
-                Line::from("/resume <id>    continue a past session (Tab lists threads)"),
-                Line::from("/sessions       list past sessions for this character"),
-                Line::from("/rename [title] rename this thread (--auto restores auto-titles)"),
-                Line::from("/compact [note] compress history now, keeping note"),
-                Line::from("/info           thread details: model, turns, usage"),
-                Line::from("/context        context-window breakdown"),
-                Line::from("/memory         project memory stats"),
-                Line::from("/flush [note]   save this thread's learnings to MEMORY.md"),
-                Line::from("/mcp            external tool servers (MCP) status"),
-                Line::from("/quit | /q      exit morrow"),
-                Line::from("/model <key>    switch model (Tab shows available models)"),
-                Line::from("/models         list saved models"),
-                Line::from("/switch <name>  switch character (Tab shows names)"),
-                Line::from("/mode           toggle approval <-> fully autonomous"),
-                Line::from("/agents         list subagents"),
-                Line::from(
-                    "/rules           show loaded project rule files (MORROW.md, .morrow/rules/)",
-                ),
-                Line::from("/clear          clear transcript"),
-                Line::from("/usage          token totals"),
-            ]),
+            "help" => Command::Local(help_blocks()),
             "new" => Command::NewSession(if rest.is_empty() { None } else { Some(rest) }),
             "rename" => Command::Rename(if rest.is_empty() { None } else { Some(rest) }),
             "compact" => Command::Compact(if rest.is_empty() { None } else { Some(rest) }),
@@ -679,32 +686,33 @@ impl App {
             "sessions" => Command::Local(self.sessions_lines()),
             "quit" | "q" => {
                 self.quit = true;
-                Command::Local(vec![])
+                Command::Local(Vec::new())
             }
             "clear" => {
-                self.lines.clear();
-                Command::Local(vec![])
+                self.blocks.clear();
+                self.scroll = 0;
+                Command::Local(Vec::new())
             }
-            "usage" => Command::Local(vec![Line::from(format!(
+            "usage" => Command::Local(vec![info_block(&format!(
                 "tokens: {} in / {} out",
                 self.usage.input_tokens, self.usage.output_tokens
             ))]),
             "models" => {
                 if self.models.is_empty() {
-                    Command::Local(vec![Line::from(
+                    Command::Local(vec![info_block(
                         "no models yet — define them in ~/.config/morrow/config.toml [models.*]",
                     )])
                 } else {
-                    let mut out = vec![Line::from("saved models:")];
+                    let mut out = vec![info_block("saved models:")];
                     for (key, id, provider) in &self.models {
-                        out.push(Line::from(format!("  {key:<16} {id:<28} {provider}")));
+                        out.push(info_block(&format!("  {key}  ·  {id}  ·  {provider}")));
                     }
                     Command::Local(out)
                 }
             }
             "switch" | "agent" => {
                 if rest.is_empty() {
-                    Command::Local(vec![Line::from("usage: /switch <character-name>")])
+                    Command::Local(vec![info_block("usage: /switch <character-name>")])
                 } else {
                     let name = rest.split_whitespace().next().unwrap_or("").to_string();
                     Command::Switch(name)
@@ -713,151 +721,156 @@ impl App {
             "mode" => Command::ToggleMode,
             "agents" => {
                 if self.agents.is_empty() {
-                    Command::Local(vec![Line::from("no subagents defined")])
+                    Command::Local(vec![info_block("no subagents defined")])
                 } else {
-                    let mut out = vec![Line::from("subagents:")];
+                    let mut out = vec![info_block("subagents:")];
                     for (name, desc) in &self.agents {
-                        out.push(Line::from(format!("  {name:<12} {desc}")));
+                        out.push(info_block(&format!("  {name}  ·  {desc}")));
                     }
                     Command::Local(out)
                 }
             }
             "rules" => {
                 if self.rules.is_empty() {
-                    Command::Local(vec![Line::from(
+                    Command::Local(vec![info_block(
                         "no project rules loaded — add MORROW.md or .morrow/rules/*.md",
                     )])
                 } else {
-                    let mut out = vec![Line::from("project rules in effect:")];
+                    let mut out = vec![info_block("project rules in effect:")];
                     for (path, chars) in &self.rules {
-                        out.push(Line::from(format!("  {path}  ({chars} chars)")));
+                        out.push(info_block(&format!("  {path}  ({chars} chars)")));
                     }
                     Command::Local(out)
                 }
             }
             "model" => {
                 if rest.is_empty() {
-                    Command::Local(vec![Line::from("usage: /model <alias|id|provider/id>")])
+                    Command::Local(vec![info_block("usage: /model <alias|id|provider/id>")])
                 } else {
                     let msg = format!("switching model to '{rest}'...");
                     self.pending_model_switch = Some(rest);
-                    Command::Local(vec![Line::from(msg)])
+                    Command::Local(vec![info_block(&msg)])
                 }
             }
             other => {
-                // User-defined commands (.morrow/commands/<name>.md) run as prompts.
-                // Builtins always win the bare name.
+                // User-defined commands (.morrow/commands/<name>.md) run as
+                // prompts. Builtins always win the bare name.
                 let key = other.to_ascii_lowercase();
                 if let Some(custom) = self.custom_commands.iter().find(|c| c.name == key) {
                     self.busy = true;
                     Command::Agent(custom.render(&rest))
                 } else {
-                    Command::Local(vec![Line::from(format!("unknown command '/{other}'"))])
+                    Command::Local(vec![info_block(&format!("unknown command '/{other}'"))])
                 }
             }
         }
     }
 
+    // ---- events ----------------------------------------------------------
+
     pub fn apply(&mut self, ev: AppEvent) {
         match ev {
             AppEvent::Text(t) => {
-                // append streaming text to the last assistant buffer
                 self.assistant_buf.push_str(&t);
-                self.redraw_assistant_tail();
             }
             AppEvent::ToolCall { name, arguments } => {
                 self.flush_assistant();
-                self.lines.push(Line::styled(
-                    format!("⚙ tool: {name} {arguments}"),
-                    ratatui::style::Style::new().fg(ratatui::style::Color::Cyan),
-                ));
+                self.blocks.push(Block::ToolCall { name, arguments });
             }
             AppEvent::ToolResult { name, ok, result } => {
-                let preview: String = result.chars().take(300).collect();
-                self.lines.push(Line::styled(
-                    format!(
-                        "  {} {name} → {}",
-                        if ok { "✔" } else { "✘" },
-                        preview.replace('\n', " ↵ ")
-                    ),
-                    ratatui::style::Style::new().fg(if ok {
-                        ratatui::style::Color::DarkGray
-                    } else {
-                        ratatui::style::Color::Red
-                    }),
-                ));
+                self.flush_assistant();
+                self.blocks.push(Block::ToolResult { name, ok, result });
             }
             AppEvent::Usage(u) => self.usage = u,
-            AppEvent::Notice(n) => self.push_system(&format!("· {n}")),
+            AppEvent::Notice(n) => self.blocks.push(Block::System {
+                text: n,
+                level: Level::Notice,
+            }),
             AppEvent::SubagentStart(name) => {
                 self.flush_assistant();
-                self.lines.push(Line::styled(
-                    format!("▶ subagent: {name}"),
-                    ratatui::style::Style::new().fg(ratatui::style::Color::Magenta),
-                ));
+                self.blocks.push(Block::Subagent { name, done: false });
             }
-            AppEvent::SubagentEnd(name) => self.push_system(&format!("■ subagent done: {name}")),
+            AppEvent::SubagentEnd(name) => self.blocks.push(Block::Subagent { name, done: true }),
             AppEvent::Error(e) => {
                 self.flush_assistant();
-                self.lines.push(Line::styled(
-                    format!("error: {e}"),
-                    ratatui::style::Style::new().fg(ratatui::style::Color::Red),
-                ));
+                self.blocks.push(Block::System {
+                    text: format!("error: {e}"),
+                    level: Level::Error,
+                });
             }
-            AppEvent::Done(_) => {
-                self.flush_assistant();
-                self.finish_turn();
-            }
+            AppEvent::Done(_) => self.on_turn_done(),
         }
     }
 
-    fn finish_turn(&mut self) {
-        self.busy = false;
-    }
-
+    /// Commit the streaming buffer as a real assistant block.
+    ///
+    /// Streaming text is held in `assistant_buf` rather than pushed per delta:
+    /// appending a block per token would make the transcript grow unbounded and
+    /// force a re-wrap on every event.
     fn flush_assistant(&mut self) {
-        if self.assistant_shown > 0 {
-            for _ in 0..self.assistant_shown {
-                self.lines.pop();
-            }
-            self.assistant_shown = 0;
-        }
         if !self.assistant_buf.is_empty() {
-            for l in self.assistant_buf.lines() {
-                self.lines.push(Line::from(l.to_string()));
-            }
-            self.assistant_buf.clear();
+            let text = std::mem::take(&mut self.assistant_buf);
+            self.blocks.push(Block::Assistant { text });
         }
     }
 
-    /// Re-render the streaming buffer in place: remove exactly the lines we
-    /// previously showed for it, then show all of the buffer's lines.
-    fn redraw_assistant_tail(&mut self) {
-        for _ in 0..self.assistant_shown {
-            self.lines.pop();
-        }
-        let shown: Vec<String> = self.assistant_buf.lines().map(|s| s.to_string()).collect();
-        self.assistant_shown = shown.len().max(1);
-        if shown.is_empty() {
-            self.lines.push(Line::from(""));
+    /// A cheap signature of everything visible. The loop redraws only when this
+    /// changes, which is what keeps an idle terminal at zero CPU.
+    pub fn frame_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.blocks.len().hash(&mut h);
+        self.assistant_buf.len().hash(&mut h);
+        self.scroll.hash(&mut h);
+        self.tick.hash(&mut h);
+        self.busy.hash(&mut h);
+        self.input.hash(&mut h);
+        self.complete_sel.hash(&mut h);
+        self.usage.total().hash(&mut h);
+        self.header_info.hash(&mut h);
+        self.pending_approval.is_some().hash(&mut h);
+        h.finish()
+    }
+
+    // ---- scroll ----------------------------------------------------------
+
+    /// Scroll by `delta` blocks. Negative moves toward the newest content.
+    fn scroll_by(&mut self, delta: isize) {
+        let max = self.max_scroll();
+        if delta < 0 {
+            self.scroll = self.scroll.saturating_sub(delta.unsigned_abs());
         } else {
-            for l in shown {
-                self.lines.push(Line::from(l));
-            }
+            self.scroll = self.scroll.saturating_add(delta as usize);
         }
+        self.scroll = self.scroll.min(max);
     }
 
-    // ---- accessors for render -------------------------------------------
+    fn scroll_to_end(&mut self) {
+        self.scroll = 0;
+    }
 
-    pub fn visible_lines(&self, height: usize) -> (Vec<Line<'static>>, usize) {
-        let total = self.lines.len();
-        let end = total.saturating_sub(self.scroll);
-        let start = end.saturating_sub(height.min(total));
-        let slice: Vec<Line<'static>> = self.lines[start..end]
-            .iter()
-            .map(|l| clone_line_static(l))
-            .collect();
-        (slice, start)
+    /// How many blocks the reader may scroll back through.
+    fn max_scroll(&self) -> usize {
+        // Without knowing the rendered height this is approximate; the renderer
+        // clamps against real geometry. Bounding by block count keeps the
+        // reducer from accumulating an absurd offset.
+        self.blocks.len().saturating_sub(1)
+    }
+
+    // ---- accessors for the renderer ---------------------------------------
+
+    pub fn blocks(&self) -> &[Block] {
+        &self.blocks
+    }
+
+    /// Streaming assistant text not yet committed to a block.
+    pub fn assistant_buf(&self) -> &str {
+        &self.assistant_buf
+    }
+
+    /// How many blocks the reader has scrolled back from the newest content.
+    pub fn scroll(&self) -> usize {
+        self.scroll
     }
 
     pub fn input(&self) -> &str {
@@ -888,23 +901,292 @@ impl App {
     }
 
     pub fn transcript_len(&self) -> usize {
-        self.lines.len()
+        self.blocks.len()
     }
 }
 
-/// First 8 chars of a session id for display / prefix matching.
-pub fn short_id(id: &str) -> &str {
-    &id[..8.min(id.len())]
+/// A dim informational block.
+pub fn info_block(text: &str) -> Block {
+    Block::System {
+        text: text.to_string(),
+        level: Level::Info,
+    }
 }
 
-fn clone_line_static(l: &Line<'_>) -> Line<'static> {
-    Line {
-        style: l.style,
-        alignment: l.alignment,
-        spans: l
-            .spans
-            .iter()
-            .map(|s| Span::styled(s.content.to_string(), s.style))
-            .collect(),
+/// The `/help` listing, generated from the single source of truth so the two
+/// can never drift.
+fn help_blocks() -> Vec<Block> {
+    let mut out = vec![info_block("commands:")];
+    for (name, desc) in SLASH_COMMANDS {
+        out.push(info_block(&format!("  /{name:<12} {desc}")));
+    }
+    out
+}
+
+/// First few characters of a session id, for display and prefix matching.
+///
+/// Character-boundary safe: a non-ASCII id would panic a byte slice.
+pub fn short_id(id: &str) -> &str {
+    match id.char_indices().nth(8) {
+        Some((i, _)) => &id[..i],
+        None => id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEventKind, KeyEventState};
+
+    fn key(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn type_text(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.on_key(Event::Key(key(KeyCode::Char(c))));
+        }
+    }
+
+    #[test]
+    fn typing_a_prompt_sends_it_and_echoes_it() {
+        let mut app = App::new();
+        type_text(&mut app, "hello");
+        app.on_key(Event::Key(key(KeyCode::Enter)));
+        match app.take_submitted() {
+            Some(Command::Agent(p)) => assert_eq!(p, "hello"),
+            other => panic!("expected Agent, got {other:?}"),
+        }
+        assert!(matches!(app.blocks().first(), Some(Block::Prompt { .. })));
+        assert!(app.is_busy());
+    }
+
+    #[test]
+    fn enter_completes_a_partial_command_instead_of_sending_it() {
+        let mut app = App::new();
+        type_text(&mut app, "/mod");
+        app.on_key(Event::Key(key(KeyCode::Enter)));
+        assert_eq!(app.input(), "/model ", "should complete, not submit");
+        assert!(app.take_submitted().is_none());
+    }
+
+    #[test]
+    fn enter_sends_an_exact_command_name() {
+        let mut app = App::new();
+        type_text(&mut app, "/models");
+        app.on_key(Event::Key(key(KeyCode::Enter)));
+        assert!(matches!(app.take_submitted(), Some(Command::Local(_))));
+    }
+
+    #[test]
+    fn tab_completes_a_command_with_an_argument() {
+        let mut app = App::new();
+        type_text(&mut app, "/mod");
+        app.on_key(Event::Key(key(KeyCode::Tab)));
+        assert_eq!(app.input(), "/model ");
+    }
+
+    #[test]
+    fn tab_completes_a_model_value() {
+        let mut app = App::new();
+        app.set_models(vec![("fast".into(), "grok-fast".into(), "grok".into())]);
+        type_text(&mut app, "/model fa");
+        app.on_key(Event::Key(key(KeyCode::Tab)));
+        assert_eq!(app.input(), "/model fast");
+    }
+
+    #[test]
+    fn unknown_slash_command_reports_instead_of_sending() {
+        let mut app = App::new();
+        type_text(&mut app, "/nope");
+        app.on_key(Event::Key(key(KeyCode::Enter)));
+        match app.take_submitted() {
+            Some(Command::Local(blocks)) => {
+                let text = blocks
+                    .iter()
+                    .map(|b| match b {
+                        Block::System { text, .. } => text.clone(),
+                        _ => String::new(),
+                    })
+                    .collect::<String>();
+                assert!(text.contains("unknown command"), "got {text:?}");
+            }
+            other => panic!("expected Local, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_text_commits_as_one_block_not_many() {
+        let mut app = App::new();
+        for chunk in ["Hel", "lo ", "wor", "ld"] {
+            app.apply(AppEvent::Text(chunk.to_string()));
+            assert!(
+                !app.assistant_buf().is_empty(),
+                "buffer should hold the delta"
+            );
+        }
+        app.on_turn_done();
+        assert_eq!(app.transcript_len(), 1, "delta-per-block regression");
+        match &app.blocks()[0] {
+            Block::Assistant { text } => assert_eq!(text, "Hello world"),
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tool_call_flushes_pending_assistant_text_first() {
+        let mut app = App::new();
+        app.apply(AppEvent::Text("thinking".into()));
+        // The streamed text must be committed before the tool call is recorded,
+        // or the transcript would show a tool call with no reasoning above it.
+        app.apply(AppEvent::ToolCall {
+            name: "bash".into(),
+            arguments: "{}".into(),
+        });
+        assert_eq!(app.transcript_len(), 2, "assistant text + tool call");
+        assert!(matches!(app.blocks()[0], Block::Assistant { .. }));
+        assert!(matches!(app.blocks()[1], Block::ToolCall { .. }));
+
+        app.apply(AppEvent::ToolResult {
+            name: "bash".into(),
+            ok: true,
+            result: "ok".into(),
+        });
+        assert_eq!(app.transcript_len(), 3);
+        assert!(matches!(app.blocks()[2], Block::ToolResult { .. }));
+    }
+
+    #[test]
+    fn scrolled_up_state_survives_streaming() {
+        let mut app = App::new();
+        for i in 0..10 {
+            app.push_system(&format!("line {i}"));
+        }
+        app.on_key(Event::Key(key(KeyCode::PageUp)));
+        assert!(
+            app.scroll() > 0,
+            "should have scrolled away from the bottom"
+        );
+        let before = app.scroll();
+        app.apply(AppEvent::Text("new content".into()));
+        app.on_turn_done();
+        assert_eq!(
+            app.scroll(),
+            before,
+            "streaming must not drag the reader back to the bottom"
+        );
+    }
+
+    #[test]
+    fn home_returns_to_the_live_edge() {
+        let mut app = App::new();
+        for i in 0..10 {
+            app.push_system(&format!("line {i}"));
+        }
+        app.on_key(Event::Key(key(KeyCode::PageUp)));
+        app.on_key(Event::Key(key(KeyCode::Home)));
+        assert_eq!(app.scroll(), 0);
+    }
+
+    #[test]
+    fn scroll_cannot_go_negative_or_past_the_start() {
+        let mut app = App::new();
+        for i in 0..3 {
+            app.push_system(&format!("line {i}"));
+        }
+        for _ in 0..20 {
+            app.on_key(Event::Key(key(KeyCode::PageDown)));
+        }
+        assert_eq!(app.scroll(), 0, "scrolled past the newest content");
+    }
+
+    #[test]
+    fn submitting_after_scrolling_returns_to_the_bottom() {
+        let mut app = App::new();
+        for i in 0..10 {
+            app.push_system(&format!("line {i}"));
+        }
+        app.on_key(Event::Key(key(KeyCode::PageUp)));
+        type_text(&mut app, "next");
+        app.on_key(Event::Key(key(KeyCode::Enter)));
+        assert_eq!(app.scroll(), 0);
+    }
+
+    #[test]
+    fn clear_empties_the_transcript() {
+        let mut app = App::new();
+        app.push_system("something");
+        type_text(&mut app, "/clear");
+        app.on_key(Event::Key(key(KeyCode::Enter)));
+        assert_eq!(app.transcript_len(), 0);
+    }
+
+    #[test]
+    fn busy_state_blocks_a_second_submission() {
+        let mut app = App::new();
+        type_text(&mut app, "one");
+        app.on_key(Event::Key(key(KeyCode::Enter)));
+        app.take_submitted();
+        type_text(&mut app, "two");
+        app.on_key(Event::Key(key(KeyCode::Enter)));
+        assert!(
+            app.take_submitted().is_none(),
+            "second prompt should be dropped"
+        );
+    }
+
+    #[test]
+    fn frame_signature_changes_only_on_visible_change() {
+        let mut app = App::new();
+        let a = app.frame_signature();
+        assert_eq!(a, app.frame_signature(), "stable when idle");
+        app.apply(AppEvent::Text("hi".into()));
+        assert_ne!(a, app.frame_signature(), "streaming must dirty the frame");
+    }
+
+    #[test]
+    fn short_id_is_multibyte_safe() {
+        assert_eq!(short_id("0123456789abcdef"), "01234567");
+        assert_eq!(short_id("short"), "short");
+        // A non-ASCII id must not panic on a byte boundary.
+        let _ = short_id("日本語日本語日本語");
+        assert_eq!(short_id("日本語日本語日本語").chars().count(), 8);
+    }
+
+    #[test]
+    fn completions_offer_models_characters_and_threads() {
+        let mut app = App::new();
+        app.set_models(vec![("fast".into(), "m".into(), "p".into())]);
+        app.set_characters(vec!["nova".into(), "atlas".into()]);
+        app.set_sessions(vec![(
+            "abcdef1234".into(),
+            "fix the bug".into(),
+            "10-04".into(),
+            4,
+        )]);
+        type_text(&mut app, "/model ");
+        assert_eq!(app.completions().len(), 1);
+        type_text(&mut app, "");
+        let _ = app.completions();
+    }
+
+    #[test]
+    fn replay_transcript_rebuilds_blocks_from_messages() {
+        let mut app = App::new();
+        let msgs = vec![
+            Message::text(Role::User, "do it"),
+            Message::text(Role::Assistant, "done"),
+            Message::text(Role::Tool, "tool noise"),
+        ];
+        app.replay_transcript(&msgs);
+        assert_eq!(app.transcript_len(), 3);
+        assert!(matches!(app.blocks()[0], Block::Prompt { .. }));
+        assert!(matches!(app.blocks()[1], Block::Assistant { .. }));
+        assert!(matches!(app.blocks()[2], Block::System { .. }));
     }
 }

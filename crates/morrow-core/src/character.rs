@@ -60,7 +60,12 @@ impl Integration {
         match &self.api_key {
             None => "(none)".into(),
             Some(k) if k.starts_with('$') => k.clone(),
-            Some(k) => format!("{}…{}", &k[..2.min(k.len())], "*".repeat(6)),
+            // Take the first two *characters*, not bytes: a byte slice would
+            // panic on a short or non-ASCII key.
+            Some(k) => {
+                let prefix: String = k.chars().take(2).collect();
+                format!("{prefix}{}", "*".repeat(6))
+            }
         }
     }
 }
@@ -405,7 +410,7 @@ mod tests {
         );
         store.save(&mut sam).unwrap();
 
-        let mut nova = store.load_or_create("Nova").unwrap();
+        let nova = store.load_or_create("Nova").unwrap();
         assert!(nova.memories.is_empty()); // never mixed
 
         let reloaded = store.load("Sam").unwrap().unwrap();
@@ -418,6 +423,35 @@ mod tests {
 
         let names: Vec<_> = store.list().unwrap().into_iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["Nova", "Sam"]);
+    }
+
+    #[test]
+    fn masked_key_is_multibyte_and_short_key_safe() {
+        let mk = |k: Option<&str>| {
+            Integration {
+                description: "x".into(),
+                base_url: "https://example.com".into(),
+                api_key: k.map(String::from),
+                headers: Default::default(),
+            }
+            .masked_key()
+        };
+
+        assert_eq!(mk(None), "(none)");
+        // Env references are shown verbatim, never masked.
+        assert_eq!(mk(Some("$TOKEN")), "$TOKEN");
+        assert_eq!(mk(Some("sk-abcdefgh")), "sk******");
+        // A one-character key: a byte slice of 2 would have panicked.
+        assert_eq!(mk(Some("k")), "k******");
+        assert_eq!(mk(Some("")), "******");
+        // Non-ASCII: two characters, six bytes. The old `&k[..2]` would have split the
+        // first character and panicked.
+        let masked = mk(Some("日本語"));
+        assert!(masked.starts_with("日本"), "got {masked}");
+        assert!(masked.ends_with("******"));
+        // Emoji, a four-byte character, is the sharpest case.
+        let masked = mk(Some("🎉🎉"));
+        assert!(masked.starts_with("🎉🎉"), "got {masked}");
     }
 
     #[test]

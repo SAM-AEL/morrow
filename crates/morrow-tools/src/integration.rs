@@ -174,11 +174,9 @@ impl Tool for IntegrationTool {
                 let status = resp.status().as_u16();
                 let text = resp.text().await.unwrap_or_default();
                 const MAX: usize = 8000;
-                let text = if text.len() > MAX {
-                    format!("{}…[truncated]", &text[..MAX])
-                } else {
-                    text
-                };
+                // Truncate on a char boundary: a byte slice would panic on any
+                // multi-byte character near the cut.
+                let text = crate::truncate_utf8(&text, MAX);
                 let _ = name;
                 Ok(format!("[{status}] {url}\n{text}"))
             }

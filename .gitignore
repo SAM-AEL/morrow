@@ -34,3 +34,6 @@
 # Logs
 # ─────────────────────────────────────────────────────────────────────────────
 *.log
+
+# Personal planning notes (not for the repo)
+/MYPLAN.md

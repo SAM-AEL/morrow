@@ -116,11 +116,9 @@ impl Tool for WebFetch {
             body
         };
 
-        let truncated = if text.len() > max_len {
-            format!("{}\n...[truncated]", &text[..max_len])
-        } else {
-            text
-        };
+        // Truncate on a char boundary: a byte slice would panic on any multi-byte
+        // character near the cut, which any real page can contain.
+        let truncated = crate::truncate_utf8(&text, max_len);
         Ok(format!(
             "[status {}] {}\n{}",
             status.as_u16(),
